@@ -17,7 +17,7 @@ import subprocess
 import argparse
 import json
 import time
-import clip
+#import clip
 import sys
 import re
 import os
