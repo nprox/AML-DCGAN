@@ -18,7 +18,10 @@ import os
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--drives-dir", type=Path, default="/mnt")
+    parser.add_argument("--max-concurrent", type=int, default=320)
     args = parser.parse_args()
+
+    subprocess.run(['aws', 'configure', 'set', 'default.s3.max_concurrent_requests', str(args.max_concurrent)], check=True)
 
     yfcc100m = []
     drives_dir = Path(args.drives_dir)
@@ -42,7 +45,7 @@ def main():
                 break
             print(folders[idx])
             dwnl = subprocess.run(["aws", 's3', 'sync', f's3://multimedia-commons/data/images/{folders[idx]}/',
-                                (drive_dir/folders[idx]), '--no-sign-request', '--region', 'us-west-2',],
+                                (drive_dir/folders[idx]), '--no-sign-request', '--region', 'us-west-2', '--only-show-errors'],
                                 check = True,)
             (drive_dir/folders[idx]/'.complete').touch()
             cntr += 1
