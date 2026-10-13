@@ -1,0 +1,2 @@
+for_captioning.json filter=lfs diff=lfs merge=lfs -text
+yfcc100m_captioned.jsonl filter=lfs diff=lfs merge=lfs -text

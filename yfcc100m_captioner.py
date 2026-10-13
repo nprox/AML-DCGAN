@@ -74,6 +74,13 @@ def caption_image(task):
         batch["captions"][level] = caption
     return batch
 
+def reparse_yfcc1000m(fldr_1):
+    return [Path(sub_fldr) for sub_fldr in fldr_1.iterdir() if sub_fldr.is_dir() and not (sub_fldr/'.parsed').is_file()]
+
+def save_queue(path,folders):
+    tmp=path.with_suffix(".tmp")
+    tmp.write_text(json.dumps([str(p) for p in folders]),encoding="utf-8")
+    tmp.replace(path)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -81,22 +88,39 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=os.getcwd())
     parser.add_argument("--parallel", type=int, default=28)
     parser.add_argument("--model", type=str, default='bartowski/Qwen3.8-27B-GGUF:Q4_K_M')
+    parser.add_argument("--folders-per-batch", type=int, default=10)
+    parser.add_argument("--reparse",action="store_true")
     args = parser.parse_args()
 
-    yfcc100m = []
-    drives_dir = Path(args.drives_dir)
-    for drive in drives_dir.iterdir():
-        drive_dir = drives_dir / re.match(r'.*/([^/]+)$', str(drive)).group(1)
-        if not os.path.exists(drive_dir / 'yfcc100m'):
-            continue
-        drive_dir = drive_dir / 'yfcc100m'
-        yfcc100m.extend([Path(sub_fldr) for fldr in drive_dir.iterdir() for sub_fldr in fldr.iterdir() \
-                        if (fldr/'.complete').is_file() and not (sub_fldr/'.parsed').is_file() and \
-                            not re.match(r'.*/.complete$', str(sub_fldr))])
+    fldr = Path(args.out_dir)
+    fldr.mkdir(parents=True, exist_ok=True)
+    queue=fldr/"for_captioning.json"
+    if args.reparse or not queue.is_file():
+        fldrs = [fldr_1 for drive in Path(args.drives_dir.resolve()).iterdir() if (drive/'yfcc100m').is_dir() \
+                    for fldr_1 in (drive/'yfcc100m').iterdir() if fldr_1.is_dir() and (fldr_1/'.complete').is_file()]
+        
+        yfcc100m = []
+        with get_context("spawn").Pool(processes=args.parallel) as pool:
+            for folders in pool.imap(reparse_yfcc1000m, fldrs, chunksize=1):
+                yfcc100m.extend(folders)
+        
+        indices=np.random.permutation(len(yfcc100m))
+        yfcc100m=[yfcc100m[idx] for idx in indices]
+        del(fldrs, indices)
+    else:
+        yfcc100m=[Path(p) for p in json.loads(queue.read_text(encoding="utf-8"))]
+        idx=0
+        while idx<len(yfcc100m) and (yfcc100m[idx]/".parsed").is_file():
+            idx+=1
+        yfcc100m = yfcc100m[idx:]
+        del(idx)
+        
+    ### indices before -> parse beginning to remove
+    save_queue(queue, yfcc100m)
+
     if not yfcc100m:
         print("No unfinished completed folders found.")
         return
-    indices = np.random.permutation(np.arange(yfcc100m.__len__()))
 
     PROMPT = {
         'small': {"prompt": "Describe this image in one concise English sentence, at most 25 words. Mention the main subject, action, and setting when visible. Return only the caption.",
@@ -118,8 +142,6 @@ def main():
     ])
 
     # batch then add to whole
-    fldr = Path(args.out_dir)
-    fldr.mkdir(parents=True, exist_ok=True)
     try:
         # Loading model.
         while True:
@@ -136,8 +158,10 @@ def main():
 
         (fldr / 'yfcc100m_captioned.jsonl').touch()
         with get_context("spawn").Pool(processes=args.parallel) as pool:
-            for idx in indices:
-                tasks = ((img, level, prmpt) for img in yfcc100m[idx].iterdir() 
+            n = args.folders_per_batch
+            for start in range(0, len(yfcc100m), n):
+                sources = yfcc100m[start:start+n]
+                tasks = ((img, level, prmpt) for source in sources for img in source.iterdir() 
                     if img.is_file() and img.suffix.lower() in {".jpg", ".jpeg", ".png"}
                     for level, prmpt in PROMPT.items() if prmpt["prompt"].strip())
                 
@@ -152,8 +176,10 @@ def main():
                 with (fldr / "yfcc100m_captioned.jsonl").open("a", encoding="utf-8") as file:
                     for value in batch.values():
                         file.write(json.dumps(value, ensure_ascii=False) + "\n")
-                (yfcc100m[idx] / '.parsed').touch()
-                print(f"Captioned {yfcc100m[idx]}: {len(batch)} images", flush=True)
+
+                for source in sources:
+                    (source / '.parsed').touch()
+                print(f"Captioned {len(sources)} folders: {len(batch)} images\n{sources}", flush=True)
     finally:
         if server.poll() is None:
             server.terminate()
