@@ -88,7 +88,7 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=os.getcwd())
     parser.add_argument("--parallel", type=int, default=28)
     parser.add_argument("--model", type=str, default='bartowski/Qwen3.8-27B-GGUF:Q4_K_M')
-    parser.add_argument("--folders-per-batch", type=int, default=30)
+    parser.add_argument("--folders-per-batch", type=int, default=50)
     parser.add_argument("--reparse",action="store_true")
     args = parser.parse_args()
 
