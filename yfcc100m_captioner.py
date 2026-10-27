@@ -90,6 +90,7 @@ def main():
     parser.add_argument("--model", type=str, default='bartowski/Qwen3.8-27B-GGUF:Q4_K_M')
     parser.add_argument("--folders-per-batch", type=int, default=50)
     parser.add_argument("--reparse",action="store_true")
+    parser.add_argument("--stop-early", action="store_true")
     args = parser.parse_args()
 
     fldr = Path(args.out_dir)
@@ -117,6 +118,8 @@ def main():
         
     ### indices before -> parse beginning to remove
     save_queue(queue, yfcc100m)
+    if args.stop_early:
+        return
 
     if not yfcc100m:
         print("No unfinished completed folders found.")
