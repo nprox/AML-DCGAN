@@ -35,13 +35,14 @@ class ComplexRMSNorm(nn.Module):
 
 # batch, channels, n, m | cat adds to channels
 def cat(*xs): return torch.cat(xs,dim=1)
-
 class EMLConv(nn.Module):
     def __init__(self, in_channels, out_channels, log_channels=None, transpose=False, \
-                 dtype=torch.complex64, device=None, gain=.2, eps=1e-6):
+                 dtype=torch.complex64, device=None, gain=.2, eps=1e-6, k=None, s=None, p=None, **kw):
         super().__init__()
         conv = nn.ConvTranspose2d if transpose else nn.Conv2d
-        k,s,p = (4,2,1) if transpose else (3,1,1)
+        k=(4 if transpose else 3) if k is None else k
+        s=(2 if transpose else 1) if s is None else s
+        p=1 if p is None else p
         kw = dict(kernel_size=k, stride=s, padding=p, bias=True, dtype=dtype, device=device)
         self.exp_filter = conv(in_channels, out_channels, **kw)
         self.log_filter = conv(in_channels if log_channels is None else log_channels,
