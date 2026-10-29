@@ -23,30 +23,36 @@ magnitudes, with normalization across the channel dimension.
 The extension and implementation are generated adaptations.
 """
 class ComplexRMSNorm(nn.Module):
-    def __init__(self,eps=1e-6):
+    def __init__(self, eps=1e-6, dim=1):
         super().__init__()
-        self.eps=eps
+        if eps <= 0: raise ValueError('eps must be positive')
+        self.eps, self.dim = eps, dim
 
     def forward(self,x):
-        power = x.real.square()+x.imag.square()
-        return x*torch.rsqrt(power.mean(dim=1,keepdim=True)+self.eps)
-
+        # Rescale before squaring: even finite complex64 values can overflow |x|².
+        scale = torch.maximum(x.real.abs(), x.imag.abs()).amax(self.dim, keepdim=True).detach().clamp_min(1)
+        z = x / scale
+        power = z.real.square() + z.imag.square()
+        return z * torch.rsqrt(power.mean(self.dim, keepdim=True) + (math.sqrt(self.eps)/scale).square())
+    
 # \end{response}
 
 # batch, channels, n, m | cat adds to channels
 def cat(*xs): return torch.cat(xs,dim=1)
 class EMLConv(nn.Module):
     def __init__(self, in_channels, out_channels, log_channels=None, transpose=False, \
-                 dtype=torch.complex64, device=None, gain=.2, eps=1e-6, k=None, s=None, p=None, **kw):
+                 dtype=torch.complex64, device=None, gain=.2, eps=1e-6, k=None, s=None, p=None, 
+                 exp_limit=12., log_floor=1e-3, **kw):
         super().__init__()
+        self.exp_limit, self.log_floor = exp_limit, log_floor
+        if log_floor is not None: self.log_shift = math.log(math.expm1(math.e-log_floor)) - math.e
         conv = nn.ConvTranspose2d if transpose else nn.Conv2d
         k=(4 if transpose else 3) if k is None else k
         s=(2 if transpose else 1) if s is None else s
         p=1 if p is None else p
         kw = dict(kernel_size=k, stride=s, padding=p, bias=True, dtype=dtype, device=device)
         self.exp_filter = conv(in_channels, out_channels, **kw)
-        self.log_filter = conv(in_channels if log_channels is None else log_channels,
-                             out_channels,**kw)
+        self.log_filter = conv(in_channels if log_channels is None else log_channels, out_channels, **kw)
         self.norm = ComplexRMSNorm(eps)
         with torch.no_grad():
             self.exp_filter.weight.mul_(gain)
@@ -59,6 +65,8 @@ class EMLConv(nn.Module):
         y = x if log_input is None else log_input
         u = self.exp_filter(x.to(dtype=dtype))
         v = self.log_filter(y.to(dtype=dtype))
+        if self.exp_limit is not None: u = torch.complex((lambda L, x: L*torch.tanh(x/L))(self.exp_limit, u.real), u.imag)
+        if self.log_floor is not None: v = torch.complex((lambda L, x, s: L + nn.functional.softplus(x+s))(self.log_floor, v.real, self.log_shift), v.imag)
         return self.norm(torch.exp(u)-torch.log(v))
 
 class ConvEmbedding(nn.Module):
@@ -124,36 +132,43 @@ class ColorFocus(nn.Module):
         return cat(R, B, G)
 
 class EMLUpcycle(nn.Module):
-    def __init__(self, in_channels, mid_channels, out_channels, start_size, out_size, device=None, **kw):
+    def __init__(self, in_channels, mid_channels, out_channels, start_size, out_size, clip_dim=None, device='cuda', dtype=torch.complex64, **kw):
         super().__init__()
-      
+
+        film = []
         blocks = [ColorFocus(in_channels, mid_channels//3, device=device, **kw)]
+        if clip_dim: film.append(FiLM(clip_dim, 3*(mid_channels//3), True, device)) 
         curr_size = start_size
         while 2*curr_size < out_size: # not the final convolution -> up
-            blocks.append(EMLConv(3*(mid_channels//3), 3*(mid_channels//3), transpose=True, device=device, **kw))
-            blocks.append(ColorFocus(3*(mid_channels//3), mid_channels//3, device=device, **kw))
+            blocks.append(nn.Sequential(EMLConv(3*(mid_channels//3), 3*(mid_channels//3), transpose=True, device=device, dtype=dtype, **kw), 
+                                        ColorFocus(3*(mid_channels//3), mid_channels//3, device=device, dtype=dtype, **kw)))
+            if clip_dim: film.append(FiLM(clip_dim, 3*(mid_channels//3), True, device)) 
             curr_size *= 2
-        blocks.append(EMLConv(3*(mid_channels//3), out_channels, transpose=True, device=device, **kw))
+        blocks.append(EMLConv(3*(mid_channels//3), out_channels, transpose=True, device=device, dtype=dtype, **kw))
+        if clip_dim: film.append(FiLM(clip_dim, out_channels, True, device)) 
         self.layers = nn.Sequential(*blocks)
+        self.films = nn.ModuleList(film) if clip_dim else None
 
-    def forward(self, x:torch.tensor):
-        return self.layers(x)
+    def forward(self, x:torch.tensor, v=None):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if self.films is not None: x = self.films[i](x, v)
+        return x
 
 class CRConvUpcycle(nn.Module):
-    def __init__(self, in_channels, mid_channels, out_channels, start_size, out_size, device=None, k=4,s=2,p=1, **kw):
+    def __init__(self, in_channels, mid_channels, out_channels, start_size, out_size, clip_dim=None, device=None, k=4,s=2,p=1, **kw):
         super().__init__()
         # real + complex components
-        blocks = [nn.Conv2d(2*in_channels, mid_channels, 3,1,1, device=device, **kw),
-                  nn.BatchNorm2d(mid_channels, device=device), nn.ReLU(inplace=True)]
+        blocks = [nn.Sequential(nn.Conv2d(2*in_channels, mid_channels, 3,1,1, device=device, **kw),
+                                nn.BatchNorm2d(mid_channels, device=device), nn.ReLU(inplace=True))]
         curr_size = start_size
         while 2*curr_size < out_size:
-            blocks.append(nn.ConvTranspose2d(mid_channels, mid_channels, k,s,p, device=device,**kw))
-            blocks.append(nn.BatchNorm2d(mid_channels, device=device, **kw))
-            blocks.append(nn.ReLU(inplace=True))
+            blocks.append(nn.Sequential(nn.ConvTranspose2d(mid_channels, mid_channels, k,s,p, device=device,**kw), 
+                          nn.BatchNorm2d(mid_channels, device=device, **kw), nn.ReLU(inplace=True)))
             curr_size *= 2
-        blocks.append(nn.ConvTranspose2d(mid_channels, out_channels, k,s,p, device=device, **kw))
-        blocks.append(nn.Tanh())
-        self.layers = nn.Sequential(*blocks)
+        self.films = nn.ModuleList(FiLM(clip_dim, mid_channels, device=device, **kw) for _ in blocks) if clip_dim else None
+        self.last = nn.ConvTranspose2d(mid_channels, out_channels, k,s,p, device=device, **kw)
+        self.layers = nn.ModuleList(blocks)
 
         for m in self.modules():
             if isinstance(m,(nn.Conv2d,nn.ConvTranspose2d)):
@@ -163,24 +178,53 @@ class CRConvUpcycle(nn.Module):
                 nn.init.normal_(m.weight,1,.02)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x:torch.tensor): 
-        return self.layers(cat(x.real, x.imag))
+    def forward(self, x:torch.tensor, v=None): 
+        x = cat(x.real, x.imag)
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if self.films is not None: x = self.films[i](x, v)
+        return self.last(x).tanh()
+
+class FiLM(nn.Module):
+    #Adapted from Perez et al. (2018), https://arxiv.org/abs/1709.07871.
+    def __init__(self, clip_dim, channels, complex_features=False, device=None, **kw):
+        super().__init__()
+        # f(x) = \alpha:gain * x + \beta:complex or real
+        self.complex_features, self.clip_dim = complex_features, clip_dim
+        self.affine = nn.Linear(clip_dim, channels*(3 if complex_features else 2), device=device, **kw)
+        self.w = nn.Parameter(self.affine.weight.new_tensor(3.))
+        self.relu6 = nn.ReLU6()
+        nn.init.normal_(self.affine.weight, 0, .02)
+        nn.init.zeros_(self.affine.bias)
+
+    def forward(self, x, v):    
+        if v is None: return x
+        # want (b, 1, c) \to (b, c) \to (b, 3ch, 1, 1) \to (b, ch, 1, 1); complex | , 1, 1) broadcasts to x: (b, ch, n, v)
+        ab = self.affine(v.reshape(-1, self.clip_dim).to(self.affine.weight)).unsqueeze(-1).unsqueeze(-1).chunk(3 if self.complex_features else 2, dim=1)
+        # \alpha = f_c(x_i) -> differs on batch | f_c = linear w/ 1 + (.1+relu6(w)/6*.8)*tanh(x) activation, .tanh() applied to real components b, ch indexing
+        return x*(1+(.1+self.relu6(self.w)/6*.8)*ab[0].tanh()) + (torch.complex(ab[1], ab[2]) if self.complex_features else ab[1])
 
 class Generator(nn.Module):
-    def __init__(self, device=None, clip_dim=16*32, embed_size=16,embed_channels=1, embed_width=3,color_width=1,eml_mid_channels=12,eml_channels=3,
-                 eml_size=128, conv_mid_channels=12, image_size=512, out_channels=3, dtype=torch.float32, **kw):
+    def __init__(self, device=None, clip_dim=16*32, embed_size=16, embed_channels=1*4, embed_width=3*8, color_width=1*8, eml_mid_channels=12*4, eml_channels=3*8,
+                 eml_size=128, conv_mid_channels=64, image_size=512, out_channels=3, exp_limit=12., log_floor=1e-3, dtype=torch.float32, **kw):
         super().__init__()
         real_kw = dict(device=device,dtype=dtype, **kw)
-        complex_kw = dict(device=device,dtype=torch.complex64 if dtype==torch.float32 else torch.complex128, **kw)
-
+        complex_kw = dict(device=device,dtype=torch.complex64 if dtype==torch.float32 else torch.complex128, 
+                           exp_limit=exp_limit, log_floor=log_floor, **kw)
+        self.config = dict(clip_dim=clip_dim, embed_size=embed_size, embed_channels=embed_channels, embed_width=embed_width,
+                           color_width=color_width, eml_mid_channels=eml_mid_channels, eml_channels=eml_channels,
+                           eml_size=eml_size, conv_mid_channels=conv_mid_channels, image_size=image_size,
+                           out_channels=out_channels, exp_limit=exp_limit, log_floor=log_floor,)
+        
         self.embed_size = embed_size
         self.embed_channels = embed_channels
 
         self.dense = nn.Linear(clip_dim, embed_channels*embed_size**2, **real_kw)
         self.embed = ConvEmbedding(embed_channels, embed_width, **complex_kw)
         self.color = ColorFocus(embed_width, color_width, **complex_kw)
-        self.eml_upcycle = EMLUpcycle(3*color_width, eml_mid_channels, eml_channels, embed_size, eml_size, **complex_kw)
-        self.upcycle = CRConvUpcycle(eml_channels, conv_mid_channels, out_channels, eml_size, image_size, k=4,p=1,s=2, **real_kw)
+        self.color_film = FiLM(clip_dim, 3*color_width, True, device=device, dtype=dtype)
+        self.eml_upcycle = EMLUpcycle(3*color_width, eml_mid_channels, eml_channels, embed_size, eml_size, clip_dim=clip_dim, **complex_kw)
+        self.upcycle = CRConvUpcycle(eml_channels, conv_mid_channels, out_channels, eml_size, image_size, clip_dim=clip_dim, k=4,p=1,s=2, **real_kw)
 
     def sample_noise(self, batch_size, generator=None):
         x = self.dense.weight
@@ -190,9 +234,9 @@ class Generator(nn.Module):
     def forward(self, x:torch.Tensor, generator=None):
         h = self.dense(x.to(self.dense.weight)).reshape(-1, self.embed_channels, self.embed_size, self.embed_size)
         h = self.embed(self.sample_noise(x.shape[0], generator=generator), h)
-        h = self.color(h)
-        h = self.eml_upcycle(h)
-        return self.upcycle(h)
+        h = self.color_film(self.color(h), x)
+        h = self.eml_upcycle(h, x)
+        return self.upcycle(h, x)
 
     '''
     Model: ChatGPT 6.1 Sol Extra-High
@@ -207,7 +251,9 @@ class Generator(nn.Module):
                 complex_keys.append(k)
                 v=torch.view_as_real(v)
             state[k]=v.contiguous().clone()
-        save_file(state,str(path),metadata={"complex_keys":json.dumps(complex_keys)})
+        save_file(state,str(path),metadata={"format": 'eml_generator.v1',
+                                            "config": json.dumps(self.config), 
+                                            "complex_keys":json.dumps(complex_keys)})
 
     def load_weights(self,path,strict=True):
         with safe_open(str(path),framework="pt",device="cpu") as f:
