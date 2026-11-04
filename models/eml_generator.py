@@ -1,3 +1,4 @@
+from torch.nn.utils.parametrizations import spectral_norm # https://www.youtube.com/watch?v=8ZqFe8goiBw
 from safetensors.torch import save_file
 from safetensors import safe_open
 from torch import nn
@@ -47,9 +48,9 @@ class EMLConv(nn.Module):
         self.exp_limit, self.log_floor = exp_limit, log_floor
         if log_floor is not None: self.log_shift = math.log(math.expm1(math.e-log_floor)) - math.e
         conv = nn.ConvTranspose2d if transpose else nn.Conv2d
-        k=(4 if transpose else 3) if k is None else k
+        k=(4 if transpose else 5) if k is None else k
         s=(2 if transpose else 1) if s is None else s
-        p=1 if p is None else p
+        p=(1 if transpose else 2) if p is None else p
         kw = dict(kernel_size=k, stride=s, padding=p, bias=True, dtype=dtype, device=device)
         self.exp_filter = conv(in_channels, out_channels, **kw)
         self.log_filter = conv(in_channels if log_channels is None else log_channels, out_channels, **kw)
@@ -102,7 +103,7 @@ class ConvEmbedding(nn.Module):
         return self.fourth(cat(nv2, nvn2))
 
 class ColorFocus(nn.Module):
-    def __init__(self, color_channels, out_channels, **kw):
+    def __init__(self, color_channels, out_channels, up=True, **kw):
         super().__init__()
         # initially thought of splitting color_channels into r, g, b but input is still abstract so an additional 3->1 won't hurt + more learned activation functions
         # Abstract for color in range(color_channels)
@@ -111,7 +112,7 @@ class ColorFocus(nn.Module):
         self.pair_colors = nn.ModuleDict({color: EMLConv(2*out_channels, out_channels, **kw) for color in ('RG', 'RB', 'GB')})
         self.second_order = nn.ModuleDict({color: EMLConv(2*out_channels, out_channels, **kw) for color in ('RGGB', 'RBBG', 'BRRG')})
         self.all = EMLConv(3*out_channels, out_channels, **kw)
-        self.to_color = nn.ModuleDict({color: EMLConv(4*out_channels, out_channels, **kw) for color in 'rgb'})
+        self.to_color = nn.ModuleDict({color: EMLConv(4*out_channels, out_channels, transpose=up, **kw) for color in 'rgb'})
 
     def forward(self, x:torch.tensor):
         r, g, b = (self.colors[c](x) for c in 'RGB')
@@ -131,20 +132,35 @@ class ColorFocus(nn.Module):
 
         return cat(R, B, G)
 
+# https://neuralception.com/convs-deconvs-artifacts/ swapping to nearest neighbor
+class EMLTranSkip(nn.Module): 
+    def __init__(self, in_channels, out_channels, func, **kw):
+        super().__init__()
+        self.func = func(in_channels, out_channels//3, **kw)
+        self.eml = EMLConv(in_channels+3*(out_channels//3), out_channels, **kw)
+        self.eml.exp_filter = spectral_norm(self.eml.exp_filter)
+        self.eml.log_filter = spectral_norm(self.eml.log_filter)
+
+    def forward(self, inp):
+        color = self.func(inp)
+        return self.eml(cat(torch.complex(
+                nn.functional.interpolate(inp.real, size=color.shape[-2:], mode='nearest'),
+                nn.functional.interpolate(inp.imag, size=color.shape[-2:], mode='nearest')),
+            color))
+    
 class EMLUpcycle(nn.Module):
     def __init__(self, in_channels, mid_channels, out_channels, start_size, out_size, clip_dim=None, device='cuda', dtype=torch.complex64, **kw):
         super().__init__()
-
         film = []
-        blocks = [ColorFocus(in_channels, mid_channels//3, device=device, **kw)]
+        blocks = [EMLTranSkip(in_channels, mid_channels, ColorFocus, device=device, **kw)]
         if clip_dim: film.append(FiLM(clip_dim, 3*(mid_channels//3), True, device)) 
-        curr_size = start_size
+        curr_size = 2*start_size
         while 2*curr_size < out_size: # not the final convolution -> up
-            blocks.append(nn.Sequential(EMLConv(3*(mid_channels//3), 3*(mid_channels//3), transpose=True, device=device, dtype=dtype, **kw), 
-                                        ColorFocus(3*(mid_channels//3), mid_channels//3, device=device, dtype=dtype, **kw)))
-            if clip_dim: film.append(FiLM(clip_dim, 3*(mid_channels//3), True, device)) 
+            blocks.append(EMLTranSkip(mid_channels, mid_channels, func=ColorFocus, device=device, dtype=dtype, **kw))
+                #nn.Sequential(#EMLConv(3*(mid_channels//3), 3*(mid_channels//3), transpose=True, device=device, dtype=dtype, **kw), )
+            if clip_dim: film.append(FiLM(clip_dim, mid_channels, True, device)) 
             curr_size *= 2
-        blocks.append(EMLConv(3*(mid_channels//3), out_channels, transpose=True, device=device, dtype=dtype, **kw))
+        blocks.append(EMLTranSkip(mid_channels, out_channels, func=ColorFocus, device=device, dtype=dtype, **kw))
         if clip_dim: film.append(FiLM(clip_dim, out_channels, True, device)) 
         self.layers = nn.Sequential(*blocks)
         self.films = nn.ModuleList(film) if clip_dim else None
@@ -156,30 +172,40 @@ class EMLUpcycle(nn.Module):
         return x
 
 class CRConvUpcycle(nn.Module):
-    def __init__(self, in_channels, mid_channels, out_channels, start_size, out_size, clip_dim=None, device=None, k=4,s=2,p=1, **kw):
+    def __init__(self, in_channels, mid_channels, out_channels, start_size, out_size, ckw, clip_dim=None, device=None, k=5,s=1,p=2, **kw):
         super().__init__()
+        self.to_real = EMLConv(in_channels, in_channels, log_channels=in_channels, **ckw)
         # real + complex components
-        blocks = [nn.Sequential(nn.Conv2d(2*in_channels, mid_channels, 3,1,1, device=device, **kw),
+        blocks = [nn.Sequential(nn.Conv2d(in_channels, mid_channels, k, s, p, device=device, **kw),
                                 nn.BatchNorm2d(mid_channels, device=device), nn.ReLU(inplace=True))]
         curr_size = start_size
         while 2*curr_size < out_size:
-            blocks.append(nn.Sequential(nn.ConvTranspose2d(mid_channels, mid_channels, k,s,p, device=device,**kw), 
+            blocks.append(nn.Sequential(
+                          nn.Upsample(scale_factor=2, mode='nearest'),
+                          nn.Conv2d(mid_channels, mid_channels, k,s,p, device=device,**kw), 
                           nn.BatchNorm2d(mid_channels, device=device, **kw), nn.ReLU(inplace=True)))
             curr_size *= 2
         self.films = nn.ModuleList(FiLM(clip_dim, mid_channels, device=device, **kw) for _ in blocks) if clip_dim else None
-        self.last = nn.ConvTranspose2d(mid_channels, out_channels, k,s,p, device=device, **kw)
-        self.layers = nn.ModuleList(blocks)
+        self.last=nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'), # apparently nn.functional. ... doesn't want to work here
+            nn.Conv2d(mid_channels,out_channels,k,s,p,device=device,**kw),
+            nn.GELU(),
+            nn.Conv2d(out_channels,out_channels,k,s,p,device=device,**kw),
+        )
 
-        for m in self.modules():
-            if isinstance(m,(nn.Conv2d,nn.ConvTranspose2d)):
-                nn.init.normal_(m.weight,0,.02)
-                if m.bias is not None: nn.init.zeros_(m.bias)
-            elif isinstance(m,nn.BatchNorm2d):
-                nn.init.normal_(m.weight,1,.02)
-                nn.init.zeros_(m.bias)
+        #ConvTranspose2d(mid_channels, out_channels, k,s,p, device=device, **kw)
+        self.layers = nn.ModuleList(blocks)
+        for root in (self.layers, self.last):
+            for m in root.modules():
+                if isinstance(m,(nn.Conv2d,nn.ConvTranspose2d)):
+                    nn.init.normal_(m.weight,0,.02)
+                    if m.bias is not None: nn.init.zeros_(m.bias)
+                elif isinstance(m,nn.BatchNorm2d):
+                    nn.init.normal_(m.weight,1,.02)
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x:torch.tensor, v=None): 
-        x = cat(x.real, x.imag)
+        x = self.to_real(x.real, x.imag).real
         for i, layer in enumerate(self.layers):
             x = layer(x)
             if self.films is not None: x = self.films[i](x, v)
@@ -206,7 +232,7 @@ class FiLM(nn.Module):
 
 class Generator(nn.Module):
     def __init__(self, device=None, clip_dim=16*32, embed_size=16, embed_channels=1*4, embed_width=3*8, color_width=1*8, eml_mid_channels=12*4, eml_channels=3*8,
-                 eml_size=128, conv_mid_channels=64, image_size=512, out_channels=3, exp_limit=12., log_floor=1e-3, dtype=torch.float32, **kw):
+                 eml_size=128, conv_mid_channels=64, image_size=256, out_channels=3, exp_limit=12., log_floor=1e-3, dtype=torch.float32, **kw):
         super().__init__()
         real_kw = dict(device=device,dtype=dtype, **kw)
         complex_kw = dict(device=device,dtype=torch.complex64 if dtype==torch.float32 else torch.complex128, 
@@ -223,8 +249,8 @@ class Generator(nn.Module):
         self.embed = ConvEmbedding(embed_channels, embed_width, **complex_kw)
         self.color = ColorFocus(embed_width, color_width, **complex_kw)
         self.color_film = FiLM(clip_dim, 3*color_width, True, device=device, dtype=dtype)
-        self.eml_upcycle = EMLUpcycle(3*color_width, eml_mid_channels, eml_channels, embed_size, eml_size, clip_dim=clip_dim, **complex_kw)
-        self.upcycle = CRConvUpcycle(eml_channels, conv_mid_channels, out_channels, eml_size, image_size, clip_dim=clip_dim, k=4,p=1,s=2, **real_kw)
+        self.eml_upcycle = EMLUpcycle(3*color_width, eml_mid_channels, eml_channels, 2*embed_size, eml_size, clip_dim=clip_dim, **complex_kw)
+        self.upcycle = CRConvUpcycle(eml_channels, conv_mid_channels, out_channels, eml_size, image_size, ckw=complex_kw, clip_dim=clip_dim, k=5,p=2,s=1, **real_kw)
 
     def sample_noise(self, batch_size, generator=None):
         x = self.dense.weight
